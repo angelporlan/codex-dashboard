@@ -7,3 +7,7 @@ __pycache__/
 .env.*
 !.env.example
 dashboard_config.local.json
+.agents
+
+# Local video production workspace; the committed promo lives in assets/.
+codex-dashboard-video/
