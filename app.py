@@ -138,7 +138,9 @@ def load_threads() -> dict:
         rows = con.execute(
             """
             select id, title, cwd, model, reasoning_effort, tokens_used,
-                   created_at, updated_at, archived, source
+                   created_at, updated_at, archived, source, first_user_message,
+                   git_branch, git_sha, git_origin_url, cli_version,
+                   agent_nickname, agent_role
             from threads
             order by updated_at desc
             """
@@ -160,6 +162,13 @@ def load_threads() -> dict:
                 "updated_at": epoch_to_iso(row["updated_at"]),
                 "archived": bool(row["archived"]),
                 "source": row["source"],
+                "first_user_message": row["first_user_message"] or "",
+                "git_branch": row["git_branch"] or "",
+                "git_sha": row["git_sha"] or "",
+                "git_origin_url": row["git_origin_url"] or "",
+                "cli_version": row["cli_version"] or "",
+                "agent_nickname": row["agent_nickname"] or "",
+                "agent_role": row["agent_role"] or "",
             }
         )
 
@@ -705,6 +714,78 @@ HTML = r"""<!doctype html>
       align-items: end;
     }
     .thread-toolbar .control { width: 100%; }
+    .thread-row { cursor: pointer; }
+    .thread-row:focus-visible { outline: none; box-shadow: var(--focus); }
+    .drawer-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 40;
+      display: none;
+      background: rgba(15, 23, 42, .46);
+      backdrop-filter: blur(10px);
+      padding: 22px;
+      overflow: auto;
+    }
+    .drawer-backdrop.open { display: grid; place-items: center; }
+    .thread-dialog {
+      width: min(860px, 100%);
+      max-height: min(86vh, 900px);
+      overflow: auto;
+      background: var(--panel-solid);
+      border: 1px solid var(--line-strong);
+      border-radius: 22px;
+      box-shadow: 0 28px 90px rgba(0, 0, 0, .28);
+      padding: 22px;
+      animation: panelIn .22s ease both;
+    }
+    .dialog-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: flex-start;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 16px;
+      margin-bottom: 16px;
+    }
+    .dialog-title {
+      margin: 6px 0 10px;
+      font-size: clamp(22px, 3vw, 34px);
+      line-height: 1.05;
+      letter-spacing: -.035em;
+    }
+    .dialog-close {
+      width: 38px;
+      height: 38px;
+      padding: 0;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .detail-item {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      background: var(--control);
+      min-width: 0;
+    }
+    .detail-value {
+      margin-top: 5px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+    .detail-message {
+      white-space: pre-wrap;
+      line-height: 1.45;
+      max-height: 220px;
+      overflow: auto;
+    }
     .empty { color: var(--muted); text-align: center; padding: 28px 12px; }
     .ok { color: var(--green); }
     .warnText { color: var(--amber); }
@@ -736,6 +817,8 @@ HTML = r"""<!doctype html>
       .metric { font-size: 27px; }
       .shell { padding: 18px; }
       .section-head { display: grid; }
+      .detail-grid { grid-template-columns: 1fr; }
+      .drawer-backdrop { padding: 12px; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
@@ -796,7 +879,22 @@ HTML = r"""<!doctype html>
       </div>
 
       <div class="panel span-5">
-        <div class="section-head"><div><div class="label">Límites de Codex</div><p id="plan">Buscando evento local reciente</p></div><span class="pill" id="limitSeen">-</span></div>
+        <div class="section-head">
+          <div>
+            <div class="label" style="display: flex; align-items: center; gap: 6px;">
+              Límites de Codex
+              <button class="info" type="button" aria-label="Información sobre porcentajes" style="position: static; width: 16px; height: 16px;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg>
+                <span class="tip" style="top: auto; bottom: 100%; margin-bottom: 8px;">Por defecto se muestra el porcentaje consumido. La app oficial de Codex suele mostrar el porcentaje restante. Usa el botón para alternar.</span>
+              </button>
+            </div>
+            <p id="plan">Buscando evento local reciente</p>
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <button id="toggleLimitsBtn" type="button" style="padding: 4px 10px; min-height: unset; font-size: 12px; border-radius: 999px;">Mostrar Restante</button>
+            <span class="pill" id="limitSeen">-</span>
+          </div>
+        </div>
         <div class="stack" id="limits"></div>
       </div>
 
@@ -884,12 +982,28 @@ HTML = r"""<!doctype html>
       </div>
     </section>
   </main>
+  <div id="threadDrawer" class="drawer-backdrop" role="dialog" aria-modal="true" aria-labelledby="threadDialogTitle" hidden>
+    <div class="thread-dialog">
+      <div class="dialog-head">
+        <div>
+          <div class="label">Detalle del thread</div>
+          <h2 id="threadDialogTitle" class="dialog-title">Thread</h2>
+          <div id="threadDialogPills" class="row" style="justify-content:flex-start; flex-wrap:wrap;"></div>
+        </div>
+        <button id="closeThreadDrawer" class="dialog-close" type="button" aria-label="Cerrar detalle">X</button>
+      </div>
+      <div id="threadDialogBody"></div>
+    </div>
+  </div>
   <script>
     const nf = new Intl.NumberFormat('es-ES');
     const dateFmt = new Intl.DateTimeFormat('es-ES', { dateStyle: 'short', timeStyle: 'short' });
     const ALL = '__all__';
     const THEME_KEY = 'codex-dashboard-theme';
+    const INVERT_LIMITS_KEY = 'codex-dashboard-invert-limits';
     let currentData = null;
+    let invertLimits = false;
+    let currentThreadDetailId = null;
 
     function fmt(value) { return nf.format(Math.round(value || 0)); }
     function esc(value) {
@@ -932,8 +1046,9 @@ HTML = r"""<!doctype html>
     }
     function limitBlock(name, item) {
       const used = pct(item?.used_percent);
+      const displayPct = invertLimits ? Math.max(0, 100 - used) : used;
       const reset = item?.reset_at ? parseDate(new Date(item.reset_at * 1000).toISOString()) : '-';
-      return `<div><div class="row"><strong>${esc(name)}</strong><span>${used}%</span></div><div class="bar"><div class="fill ${statusClass(used)}" style="width:${used}%"></div></div><div class="sub">${esc(item?.window_minutes || '-')} min · reset ${esc(reset)}</div></div>`;
+      return `<div><div class="row"><strong>${esc(name)}</strong><span>${Math.round(displayPct)}%</span></div><div class="bar"><div class="fill ${statusClass(used)}" style="width:${displayPct}%"></div></div><div class="sub">${esc(item?.window_minutes || '-')} min · reset ${esc(reset)}</div></div>`;
     }
     function budgetBlock(name, used, budget) {
       if (!budget) return `<div><div class="row"><strong>${esc(name)}</strong><span>sin tope</span></div><div class="bar"><div class="fill" style="width:0%"></div></div></div>`;
@@ -1036,6 +1151,59 @@ HTML = r"""<!doctype html>
         return epochMs(b.updated_at) - epochMs(a.updated_at);
       });
     }
+    function detailItem(label, value) {
+      const display = value === undefined || value === null || value === '' ? '-' : value;
+      return `<div class="detail-item"><div class="label">${esc(label)}</div><div class="detail-value">${esc(display)}</div></div>`;
+    }
+    function openThreadDetail(threadId) {
+      if (!currentData) return;
+      const row = currentData.threads.find(item => item.id === threadId);
+      if (!row) return;
+      currentThreadDetailId = threadId;
+      const projectName = threadProject(row);
+      document.getElementById('threadDialogTitle').textContent = row.title || 'Thread';
+      document.getElementById('threadDialogPills').innerHTML = [
+        `<span class="pill project">${esc(projectName)}</span>`,
+        `<span class="pill model">${esc(row.model || 'desconocido')}</span>`,
+        `<span class="pill ${row.archived ? 'archived' : 'active'}">${row.archived ? 'Archivado' : 'Activo'}</span>`,
+      ].join('');
+      document.getElementById('threadDialogBody').innerHTML = `
+        <div class="detail-grid">
+          ${detailItem('Tokens usados', fmt(row.tokens_used))}
+          ${detailItem('Reasoning', row.reasoning_effort || '-')}
+          ${detailItem('Creado', parseDate(row.created_at))}
+          ${detailItem('Actualizado', parseDate(row.updated_at))}
+          ${detailItem('Origen', row.source || '-')}
+          ${detailItem('CLI', row.cli_version || '-')}
+          ${detailItem('Rama Git', row.git_branch || '-')}
+          ${detailItem('SHA Git', row.git_sha || '-')}
+          ${detailItem('Agente', [row.agent_nickname, row.agent_role].filter(Boolean).join(' / ') || '-')}
+          ${detailItem('Thread ID', row.id || '-')}
+          ${detailItem('Proyecto', projectName)}
+          ${detailItem('Ruta', row.cwd || '-')}
+          ${detailItem('Remoto Git', row.git_origin_url || '-')}
+        </div>
+        <div class="detail-item" style="margin-top:12px;">
+          <div class="label">Primer mensaje</div>
+          <div class="detail-value detail-message">${esc(row.first_user_message || row.title || '-')}</div>
+        </div>
+      `;
+      const drawer = document.getElementById('threadDrawer');
+      drawer.hidden = false;
+      drawer.classList.add('open');
+      document.getElementById('closeThreadDrawer').focus();
+    }
+    function closeThreadDetail() {
+      const drawer = document.getElementById('threadDrawer');
+      drawer.classList.remove('open');
+      drawer.hidden = true;
+      const previousId = currentThreadDetailId;
+      currentThreadDetailId = null;
+      if (previousId) {
+        const row = document.querySelector(`[data-thread-id="${CSS.escape(previousId)}"]`);
+        if (row) row.focus();
+      }
+    }
     function renderThreads() {
       if (!currentData) return;
       const rows = filteredThreads();
@@ -1045,7 +1213,7 @@ HTML = r"""<!doctype html>
       document.getElementById('threads').innerHTML = visible.map((row, index) => {
         const projectName = threadProject(row);
         const delay = Math.min(index, 12) * 18;
-        return `<tr style="animation-delay:${delay}ms">
+        return `<tr class="thread-row" tabindex="0" data-thread-id="${esc(row.id)}" style="animation-delay:${delay}ms" title="Ver detalle del thread">
           <td><div class="truncate" title="${esc(row.title)}"><strong>${esc(row.title)}</strong></div><div class="path truncate" title="${esc(row.id)}">${esc(row.id || '')}</div></td>
           <td><span class="pill project" title="${esc(projectName)}">${esc(projectName)}</span><div class="path truncate" title="${esc(row.cwd)}">${esc(row.cwd || '-')}</div></td>
           <td><span class="pill model" title="${esc(row.model)}">${esc(row.model)}</span></td>
@@ -1112,6 +1280,16 @@ HTML = r"""<!doctype html>
     }
 
     applyTheme(initialTheme());
+    invertLimits = storageGet(INVERT_LIMITS_KEY) === 'true';
+    document.getElementById('toggleLimitsBtn').textContent = invertLimits ? 'Mostrar Consumido' : 'Mostrar Restante';
+
+    document.getElementById('toggleLimitsBtn').addEventListener('click', () => {
+      invertLimits = !invertLimits;
+      storageSet(INVERT_LIMITS_KEY, String(invertLimits));
+      document.getElementById('toggleLimitsBtn').textContent = invertLimits ? 'Mostrar Consumido' : 'Mostrar Restante';
+      if (currentData) render(currentData);
+    });
+
     document.getElementById('themeToggle').addEventListener('click', () => {
       applyTheme(document.body.dataset.theme === 'dark' ? 'light' : 'dark');
     });
@@ -1122,6 +1300,24 @@ HTML = r"""<!doctype html>
     });
     ['threadSearch', 'threadMinTokens'].forEach(id => {
       document.getElementById(id).addEventListener('input', debounce(renderThreads));
+    });
+    document.getElementById('threads').addEventListener('click', event => {
+      const row = event.target.closest('.thread-row');
+      if (row?.dataset.threadId) openThreadDetail(row.dataset.threadId);
+    });
+    document.getElementById('threads').addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      const row = event.target.closest('.thread-row');
+      if (!row?.dataset.threadId) return;
+      event.preventDefault();
+      openThreadDetail(row.dataset.threadId);
+    });
+    document.getElementById('closeThreadDrawer').addEventListener('click', closeThreadDetail);
+    document.getElementById('threadDrawer').addEventListener('click', event => {
+      if (event.target.id === 'threadDrawer') closeThreadDetail();
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !document.getElementById('threadDrawer').hidden) closeThreadDetail();
     });
     document.getElementById('clearThreadFilters').addEventListener('click', () => {
       document.getElementById('threadProjectFilter').value = ALL;
@@ -1208,7 +1404,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    port = int(os.environ.get("PORT", "8766"))
+    port = int(os.environ.get("PORT", "8765"))
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"Dashboard listo en http://127.0.0.1:{port}")
     print(f"Leyendo datos de {CODEX_DIR}")
