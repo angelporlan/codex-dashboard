@@ -1,0 +1,7 @@
+{
+  "token_budget": {
+    "daily": 0,
+    "monthly": 0
+  },
+  "notes": "Estos limites son presupuestos locales opcionales. Los limites reales de Codex se leen desde los eventos codex.rate_limits guardados en logs_2.sqlite cuando existen."
+}
