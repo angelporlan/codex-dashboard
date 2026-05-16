@@ -54,6 +54,15 @@ def epoch_to_iso(value: int | float | None) -> str | None:
         return None
 
 
+def iso_to_epoch(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def parse_kv_metrics(message: str) -> dict:
     metrics = {}
     for key in TOKEN_KEYS:
@@ -82,9 +91,39 @@ def parse_rate_limit_event(message: str) -> dict | None:
     return data
 
 
+def normalize_session_rate_limits(payload: dict, timestamp: str | None, path: Path | None = None) -> dict | None:
+    rate_limits = payload.get("rate_limits")
+    if not rate_limits:
+        return None
+    now = int(datetime.now(tz=timezone.utc).timestamp())
+    normalized = {
+        "type": "codex.rate_limits",
+        "plan_type": rate_limits.get("plan_type"),
+        "rate_limits": {},
+        "code_review_rate_limits": None,
+        "additional_rate_limits": None,
+        "credits": rate_limits.get("credits"),
+        "promo": None,
+        "seen_at": timestamp,
+        "source": "session_jsonl",
+    }
+    if path:
+        normalized["source_file"] = path.name
+    for name in ("primary", "secondary"):
+        item = rate_limits.get(name) or {}
+        reset_at = item.get("reset_at", item.get("resets_at"))
+        normalized["rate_limits"][name] = {
+            "used_percent": item.get("used_percent", 0),
+            "window_minutes": item.get("window_minutes"),
+            "reset_at": reset_at,
+            "reset_after_seconds": max(0, int(reset_at or now) - now),
+        }
+    return normalized
+
+
 def load_threads() -> dict:
     if not STATE_DB.exists():
-        return {"threads": [], "totals": {"tokens": 0, "count": 0}}
+        return {"threads": [], "totals": {"tokens": 0, "count": 0}, "by_model": []}
 
     with open_ro(STATE_DB) as con:
         rows = con.execute(
@@ -113,12 +152,22 @@ def load_threads() -> dict:
             }
         )
 
+    by_model = defaultdict(lambda: {"thread_tokens": 0, "threads": 0})
+    for item in threads:
+        model = item["model"] or "desconocido"
+        by_model[model]["thread_tokens"] += item["tokens_used"]
+        by_model[model]["threads"] += 1
+
     return {
         "threads": threads,
         "totals": {
             "tokens": sum(item["tokens_used"] for item in threads),
             "count": len(threads),
         },
+        "by_model": [
+            {"model": key, **value}
+            for key, value in sorted(by_model.items(), key=lambda item: item[1]["thread_tokens"], reverse=True)
+        ],
     }
 
 
@@ -192,27 +241,74 @@ def load_response_events(days: int) -> dict:
 
 
 def load_latest_rate_limits() -> dict | None:
-    if not LOGS_DB.exists():
+    candidates = []
+
+    if LOGS_DB.exists():
+        with open_ro(LOGS_DB) as con:
+            rows = con.execute(
+                """
+                select ts, feedback_log_body
+                from logs
+                where feedback_log_body like '%websocket event: {"type":"codex.rate_limits"%'
+                order by id desc
+                limit 20
+                """
+            ).fetchall()
+
+        for row in rows:
+            event = parse_rate_limit_event(row["feedback_log_body"] or "")
+            if event:
+                event["seen_at"] = epoch_to_iso(row["ts"])
+                event["source"] = "logs_sqlite"
+                candidates.append(event)
+                break
+
+    candidates.extend(load_latest_session_rate_limits())
+    if not candidates:
         return None
 
-    with open_ro(LOGS_DB) as con:
+    return max(candidates, key=lambda item: iso_to_epoch(item.get("seen_at")) or 0)
+
+
+def load_latest_session_rate_limits() -> list[dict]:
+    if not STATE_DB.exists():
+        return []
+
+    with open_ro(STATE_DB) as con:
         rows = con.execute(
             """
-            select ts, feedback_log_body
-            from logs
-            where feedback_log_body like '%"type":"codex.rate_limits"%'
-              and feedback_log_body like '%websocket event:%'
-            order by id desc
-            limit 80
+            select rollout_path
+            from threads
+            where rollout_path is not null and rollout_path != ''
+            order by updated_at desc
+            limit 30
             """
         ).fetchall()
 
+    candidates = []
+    seen_paths = set()
     for row in rows:
-        event = parse_rate_limit_event(row["feedback_log_body"] or "")
-        if event:
-            event["seen_at"] = epoch_to_iso(row["ts"])
-            return event
-    return None
+        path = Path(row["rollout_path"])
+        if path in seen_paths or not path.exists():
+            continue
+        seen_paths.add(path)
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = data.get("payload") or {}
+            event = normalize_session_rate_limits(payload, data.get("timestamp"), path)
+            if event:
+                candidates.append(event)
+                break
+    return candidates
 
 
 def build_summary(days: int) -> dict:
@@ -226,6 +322,33 @@ def build_summary(days: int) -> dict:
         for key in totals:
             totals[key] += row[key]
 
+    window_by_model = {row["model"]: row for row in responses["by_model"]}
+    model_names = {row["model"] for row in threads["by_model"]} | set(window_by_model)
+    model_usage = []
+    thread_by_model = {row["model"]: row for row in threads["by_model"]}
+    for model in sorted(
+        model_names,
+        key=lambda name: (
+            thread_by_model.get(name, {}).get("thread_tokens", 0),
+            window_by_model.get(name, {}).get("total", 0),
+        ),
+        reverse=True,
+    ):
+        thread_row = thread_by_model.get(model, {})
+        window_row = window_by_model.get(model, {})
+        model_usage.append(
+            {
+                "model": model,
+                "threads": thread_row.get("threads", 0),
+                "thread_tokens": thread_row.get("thread_tokens", 0),
+                "window_calls": window_row.get("calls", 0),
+                "window_tokens": window_row.get("total", 0),
+                "window_input": window_row.get("input", 0),
+                "window_output": window_row.get("output", 0),
+                "window_reasoning": window_row.get("reasoning", 0),
+            }
+        )
+
     return {
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "paths": {
@@ -238,6 +361,7 @@ def build_summary(days: int) -> dict:
         "rate_limits": rate_limits,
         "response_totals": totals,
         "responses": responses,
+        "model_usage": model_usage,
         "thread_totals": threads["totals"],
         "threads": threads["threads"][:100],
     }
@@ -415,8 +539,9 @@ HTML = r"""<!doctype html>
 
       <div class="panel span-8">
         <div class="label">Modelos</div>
+        <p>Historico local por threads y detalle medido en la ventana seleccionada.</p>
         <table>
-          <thead><tr><th>Modelo</th><th>Llamadas</th><th>Total</th><th>Input</th><th>Output</th><th>Reasoning</th></tr></thead>
+          <thead><tr><th>Modelo</th><th>Threads</th><th>Tokens historicos</th><th>Llamadas ventana</th><th>Tokens ventana</th><th>Input / Output</th></tr></thead>
           <tbody id="models"></tbody>
         </table>
       </div>
@@ -449,7 +574,7 @@ HTML = r"""<!doctype html>
     function limitBlock(name, item) {
       const used = pct(item?.used_percent);
       const reset = item?.reset_at ? parseDate(new Date(item.reset_at * 1000).toISOString()) : '-';
-      return `<div><div class="row"><strong>${name}</strong><span>${used}%</span></div><div class="bar"><div class="fill ${statusClass(used)}" style="width:${used}%"></div></div><div class="sub">${item?.window_minutes || '-'} min · reset ${reset}</div></div>`;
+      return `<div><div class="row"><strong>${name}</strong><span>${used}%</span></div><div class="bar"><div class="fill ${statusClass(used)}" style="width:${used}%"></div></div><div class="sub">${item?.window_minutes || '-'} min - reset ${reset}</div></div>`;
     }
     function budgetBlock(name, used, budget) {
       if (!budget) return `<div><div class="row"><strong>${name}</strong><span>sin tope</span></div><div class="bar"><div class="fill" style="width:0%"></div></div></div>`;
@@ -492,19 +617,19 @@ HTML = r"""<!doctype html>
     function render(data) {
       currentData = data;
       document.getElementById('totalTokens').textContent = fmt(data.response_totals.total);
-      document.getElementById('totalTokensSub').textContent = `${fmt(data.response_totals.input)} input · ${fmt(data.response_totals.output)} output`;
+      document.getElementById('totalTokensSub').textContent = `${fmt(data.response_totals.input)} input - ${fmt(data.response_totals.output)} output`;
       document.getElementById('calls').textContent = fmt(data.response_totals.calls);
       document.getElementById('threadTokens').textContent = fmt(data.thread_totals.tokens);
       document.getElementById('threadCount').textContent = `${fmt(data.thread_totals.count)} threads en state_5.sqlite`;
       document.getElementById('cached').textContent = fmt(data.response_totals.cached);
 
       const limits = data.rate_limits?.rate_limits;
-      document.getElementById('plan').textContent = data.rate_limits ? `Plan: ${data.rate_limits.plan_type || 'desconocido'}` : 'No hay evento de limites en los logs locales.';
+      document.getElementById('plan').textContent = data.rate_limits ? `Plan: ${data.rate_limits.plan_type || 'desconocido'} - fuente: ${data.rate_limits.source || 'local'}` : 'No hay evento de limites en los datos locales.';
       document.getElementById('limitSeen').textContent = data.rate_limits?.seen_at ? parseDate(data.rate_limits.seen_at) : 'sin datos';
       document.getElementById('limits').innerHTML = limits ? [
         limitBlock('Ventana primaria', limits.primary),
         limitBlock('Ventana secundaria', limits.secondary)
-      ].join('') : '<p class="warnText">Abre Codex o ejecuta una conversacion para que aparezca el ultimo evento codex.rate_limits.</p>';
+      ].join('') : '<p class="warnText">Abre Codex o ejecuta una conversacion para que aparezca el ultimo evento de limites.</p>';
 
       document.getElementById('dailyBudget').value = data.config?.token_budget?.daily || 0;
       document.getElementById('monthlyBudget').value = data.config?.token_budget?.monthly || 0;
@@ -515,9 +640,16 @@ HTML = r"""<!doctype html>
         budgetBlock('Ventana actual', data.response_totals.total, Number(document.getElementById('monthlyBudget').value))
       ].join('');
 
-      document.getElementById('models').innerHTML = data.responses.by_model.map(row => `
-        <tr><td><span class="pill">${esc(row.model)}</span></td><td>${fmt(row.calls)}</td><td>${fmt(row.total)}</td><td>${fmt(row.input)}</td><td>${fmt(row.output)}</td><td>${fmt(row.reasoning)}</td></tr>
-      `).join('') || '<tr><td colspan="6">Sin eventos de tokens en esta ventana.</td></tr>';
+      document.getElementById('models').innerHTML = data.model_usage.map(row => `
+        <tr>
+          <td><span class="pill">${esc(row.model)}</span></td>
+          <td>${fmt(row.threads)}</td>
+          <td>${fmt(row.thread_tokens)}</td>
+          <td>${fmt(row.window_calls)}</td>
+          <td>${fmt(row.window_tokens)}</td>
+          <td>${fmt(row.window_input)} / ${fmt(row.window_output)}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="6">Sin modelos registrados.</td></tr>';
 
       document.getElementById('threads').innerHTML = data.threads.slice(0, 30).map(row => `
         <tr><td class="truncate" title="${esc(row.title)}">${esc(row.title)}</td><td class="truncate" title="${esc(row.cwd)}">${esc(row.cwd)}</td><td>${esc(row.model)}</td><td>${fmt(row.tokens_used)}</td><td>${parseDate(row.updated_at)}</td></tr>
@@ -526,7 +658,7 @@ HTML = r"""<!doctype html>
     }
     async function load() {
       const days = document.getElementById('days').value;
-      const res = await fetch(`/api/summary?days=${encodeURIComponent(days)}`);
+      const res = await fetch(`/api/summary?days=${encodeURIComponent(days)}&t=${Date.now()}`, { cache: 'no-store' });
       if (!res.ok) throw new Error(await res.text());
       render(await res.json());
     }
@@ -544,6 +676,7 @@ HTML = r"""<!doctype html>
     load().catch(error => {
       document.body.insertAdjacentHTML('afterbegin', `<div role="alert" class="error" style="padding:16px">${error.message}</div>`);
     });
+    setInterval(() => load().catch(() => {}), 15000);
   </script>
 </body>
 </html>"""
@@ -554,6 +687,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json; charset=utf-8")
+        self.send_header("cache-control", "no-store")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -564,6 +698,7 @@ class Handler(BaseHTTPRequestHandler):
             body = HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("cache-control", "no-store")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
