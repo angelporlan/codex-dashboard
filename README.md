@@ -3,13 +3,13 @@
 Dashboard local en Python para observar el uso reciente de Codex Desktop: tokens, sesiones, modelos, cache, limites y threads recientes, todo leido en modo solo lectura desde tu instalacion local.
 
 <p align="center">
-  <video src="https://github.com/angelporlan/codex-dashboard/raw/main/assets/codex-dashboard-promo.mp4" controls="controls" muted="muted" width="900">
-    Tu navegador no puede reproducir el video embebido. Puedes abrirlo desde assets/codex-dashboard-promo.mp4.
-  </video>
+  <a href="https://github.com/angelporlan/codex-dashboard/raw/main/assets/codex-dashboard-promo.mp4">
+    <img src="assets/codex-dashboard-promo.gif" alt="Codex Usage Dashboard promo video" width="900">
+  </a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/angelporlan/codex-dashboard/blob/main/assets/codex-dashboard-promo.mp4">Ver video promo</a>
+  <a href="https://github.com/angelporlan/codex-dashboard/raw/main/assets/codex-dashboard-promo.mp4">Abrir MP4</a>
 </p>
 
 ## Que Muestra
@@ -60,7 +60,7 @@ Estos valores son referencias locales para comparar consumo; no representan nece
 
 ## Video Promo
 
-El README incluye un video promocional renderizado para GitHub:
+El README muestra un GIF optimizado para que GitHub lo previsualice directamente. Al hacer clic se abre el MP4 completo:
 
 ```text
 assets/codex-dashboard-promo.mp4
