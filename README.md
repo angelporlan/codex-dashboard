@@ -57,11 +57,3 @@ La app no modifica bases de datos de Codex; las abre en modo lectura.
 ```
 
 Estos valores son referencias locales para comparar consumo; no representan necesariamente limites reales de Codex.
-
-## Video Promo
-
-El README muestra un GIF optimizado para que GitHub lo previsualice directamente. Al hacer clic se abre el MP4 completo:
-
-```text
-assets/codex-dashboard-promo.mp4
-```
